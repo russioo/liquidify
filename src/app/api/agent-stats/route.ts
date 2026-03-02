@@ -3,6 +3,13 @@ import { supabase } from "@/lib/supabase";
 import type { AgentStats, AgentData } from "@/lib/types";
 
 export async function GET() {
+  if (!supabase) {
+    return NextResponse.json(
+      { error: "Supabase not configured" },
+      { status: 503 },
+    );
+  }
+
   const { data, error } = await supabase
     .from("agent_stats")
     .select("*")
