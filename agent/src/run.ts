@@ -1,7 +1,7 @@
-import { Transaction, LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
-import { createBurnInstruction, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import { createRequire } from "node:module";
+import { Transaction, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
 import BN from "bn.js";
-import * as PumpSwap from "@pump-fun/pump-swap-sdk";
 import { config, agent, connection } from "./config.js";
 import { saveAgentCycle, type FeedEntry } from "./db.js";
 import { generateThought } from "./thought.js";
@@ -9,37 +9,42 @@ import {
   sleep,
   sendAndConfirm,
   getTokenBalance,
+  getSolBalance,
   getAgentTokenAta,
   appendV2Account,
-  bondingCurveV2Pda,
   poolV2Pda,
-  PUMP_PROGRAM_ID,
   PUMP_AMM_PROGRAM_ID,
 } from "./helpers.js";
 
-const agentTokenAta = getAgentTokenAta(agent.publicKey, config.mint);
+const _require = createRequire(import.meta.url);
+const Pump = _require("@pump-fun/pump-sdk");
+const PumpSwap = _require("@pump-fun/pump-swap-sdk");
 
-async function getCreatorVaultBalance(): Promise<number> {
-  try {
-    const bal = await connection.getBalance(
-      PublicKey.findProgramAddressSync(
-        [Buffer.from("creator-vault"), config.mint.toBuffer()],
-        PUMP_PROGRAM_ID,
-      )[0],
-    );
-    return bal / LAMPORTS_PER_SOL;
-  } catch {
-    return 0;
-  }
-}
+const SOL_RESERVE = 0.02;
+const MIN_VAULT = 0.01;
+
+const agentTokenAta = getAgentTokenAta(agent.publicKey, config.mint);
+const pumpOnline = new Pump.OnlinePumpSdk(connection);
+const pumpOffline = new Pump.PumpSdk();
+const pumpAmmOnline = new PumpSwap.OnlinePumpAmmSdk(connection);
+const pumpAmmOffline = new PumpSwap.PumpAmmSdk();
+
+// ═══════════════════════════════════════
+// DETECT MIGRATION
+// ═══════════════════════════════════════
 
 async function isTokenMigrated(): Promise<boolean> {
   try {
-    const poolKey = PumpSwap.getPoolPda(config.mint);
-    const acc = await connection.getAccountInfo(poolKey);
-    return acc !== null;
+    const feeResult = await pumpOnline.getMinimumDistributableFee(config.mint);
+    return feeResult.isGraduated;
   } catch {
-    return false;
+    try {
+      const poolKey = PumpSwap.canonicalPumpPoolPda(config.mint);
+      const poolInfo = await connection.getAccountInfo(poolKey);
+      return poolInfo !== null;
+    } catch {
+      return false;
+    }
   }
 }
 
@@ -48,134 +53,123 @@ async function isTokenMigrated(): Promise<boolean> {
 // ═══════════════════════════════════════
 
 async function claimFees(): Promise<{ sol: number; sig: string } | null> {
-  const vaultBal = await getCreatorVaultBalance();
-  if (vaultBal < 0.005) {
-    console.log(`[claim] Vault: ${vaultBal.toFixed(4)} SOL — too low, skipping`);
+  const bal = await pumpOnline.getCreatorVaultBalanceBothPrograms(agent.publicKey);
+  const vaultSol = bal.toNumber() / LAMPORTS_PER_SOL;
+
+  if (vaultSol < MIN_VAULT) {
+    console.log(`[claim] Vault: ${vaultSol.toFixed(4)} SOL — below ${MIN_VAULT}, skipping`);
     return null;
   }
 
-  console.log(`[claim] Vault: ${vaultBal.toFixed(4)} SOL — claiming...`);
+  console.log(`[claim] Vault: ${vaultSol.toFixed(4)} SOL — claiming...`);
 
-  const pumpSdk = new PumpSwap.PumpAmmSdk();
-  const ix = pumpSdk.collectCoinCreatorFeeInstructions({
-    creator: agent.publicKey,
-    mint: config.mint,
-  });
+  const solBefore = await getSolBalance(connection, agent.publicKey);
 
+  const ix = await pumpOnline.collectCoinCreatorFeeInstructions(agent.publicKey, agent.publicKey);
   const tx = new Transaction().add(...ix);
   const sig = await sendAndConfirm(connection, tx, agent);
-  console.log(`[claim] Claimed ${vaultBal.toFixed(4)} SOL — tx: ${sig}`);
 
-  return { sol: vaultBal, sig };
+  const solAfter = await getSolBalance(connection, agent.publicKey);
+  const actualClaimed = (solAfter - solBefore) / LAMPORTS_PER_SOL;
+
+  if (actualClaimed <= 0) {
+    console.log(`[claim] TX confirmed but no SOL increase — skipping`);
+    return null;
+  }
+
+  console.log(`[claim] Claimed ${actualClaimed.toFixed(4)} SOL — tx: ${sig}`);
+  return { sol: actualClaimed, sig };
+}
+
+function getSpendable(walletLamports: number, claimed: number): number {
+  const walletSol = walletLamports / LAMPORTS_PER_SOL;
+  const spendable = walletSol - SOL_RESERVE;
+  if (spendable <= 0) return 0;
+  return Math.min(claimed, spendable);
 }
 
 // ═══════════════════════════════════════
-// BUYBACK (pre-migration: 100% of fees)
+// BUYBACK — bonding curve (pre-migration)
 // ═══════════════════════════════════════
 
 async function doBuyback(solAmount: number): Promise<{ sig: string; tokens: bigint }> {
+  const tokensBefore = await getTokenBalance(connection, agentTokenAta);
+
   const solBn = new BN(Math.floor(solAmount * LAMPORTS_PER_SOL));
-  const migrated = await isTokenMigrated();
 
-  let sig: string;
+  const global = await pumpOnline.fetchGlobal();
+  const { bondingCurveAccountInfo, bondingCurve, associatedUserAccountInfo } =
+    await pumpOnline.fetchBuyState(config.mint, agent.publicKey, TOKEN_2022_PROGRAM_ID);
 
-  if (migrated) {
-    console.log("[buyback] Token is migrated — buying via AMM");
-    const pumpAmmSdk = new PumpSwap.PumpAmmSdk();
-    const poolKey = PumpSwap.getPoolPda(config.mint);
-    const swapState = await pumpAmmSdk.swapSolanaState(connection, poolKey, agent.publicKey);
-    const buyIx = pumpAmmSdk.buyQuoteInput(swapState, solBn, 2);
-    appendV2Account(buyIx, PUMP_AMM_PROGRAM_ID, poolV2Pda(config.mint));
-    const tx = new Transaction().add(...buyIx);
-    sig = await sendAndConfirm(connection, tx, agent);
-  } else {
-    console.log("[buyback] Token on bonding curve — buying via curve");
-    // Use PumpPortal API or direct bonding curve interaction
-    // For bonding curve, we need the pump SDK
-    const pumpAmmSdk = new PumpSwap.PumpAmmSdk();
-    const poolKey = PumpSwap.getPoolPda(config.mint);
-    const swapState = await pumpAmmSdk.swapSolanaState(connection, poolKey, agent.publicKey);
-    const buyIx = pumpAmmSdk.buyQuoteInput(swapState, solBn, 2);
-    appendV2Account(buyIx, PUMP_AMM_PROGRAM_ID, poolV2Pda(config.mint));
-    const tx = new Transaction().add(...buyIx);
-    sig = await sendAndConfirm(connection, tx, agent);
-  }
+  const tokenAmount = Pump.getBuyTokenAmountFromSolAmount({
+    global,
+    feeConfig: null,
+    mintSupply: bondingCurve.tokenTotalSupply,
+    bondingCurve,
+    amount: solBn,
+  });
+
+  console.log(`[buyback] ${solAmount.toFixed(4)} SOL → ~${tokenAmount.toString()} tokens`);
+
+  const buyIx = await pumpOffline.buyInstructions({
+    global,
+    bondingCurveAccountInfo,
+    bondingCurve,
+    associatedUserAccountInfo,
+    mint: config.mint,
+    user: agent.publicKey,
+    amount: tokenAmount,
+    solAmount: solBn,
+    slippage: 2,
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+  });
+
+  const tx = new Transaction().add(...buyIx);
+  const sig = await sendAndConfirm(connection, tx, agent);
 
   await sleep(3000);
-  const balance = await getTokenBalance(connection, agentTokenAta);
-  console.log(`[buyback] Bought tokens — balance: ${balance.toString()}, tx: ${sig}`);
+  const tokensAfter = await getTokenBalance(connection, agentTokenAta);
+  const newTokens = tokensAfter > tokensBefore ? tokensAfter - tokensBefore : BigInt(0);
+  console.log(`[buyback] Bought ${newTokens.toString()} tokens — tx: ${sig}`);
 
-  return { sig, tokens: balance };
+  return { sig, tokens: newTokens };
 }
 
 // ═══════════════════════════════════════
-// BURN (after buyback)
-// ═══════════════════════════════════════
-
-async function doBurn(): Promise<{ sig: string; burned: bigint } | null> {
-  let balance = await getTokenBalance(connection, agentTokenAta);
-  if (balance === BigInt(0)) {
-    await sleep(3000);
-    balance = await getTokenBalance(connection, agentTokenAta);
-  }
-
-  if (balance === BigInt(0)) {
-    console.log("[burn] No tokens to burn");
-    return null;
-  }
-
-  const burnIx = createBurnInstruction(
-    agentTokenAta,
-    config.mint,
-    agent.publicKey,
-    balance,
-    [],
-    TOKEN_2022_PROGRAM_ID,
-  );
-  const sig = await sendAndConfirm(connection, new Transaction().add(burnIx), agent);
-  console.log(`[burn] Burned ${balance.toString()} tokens — tx: ${sig}`);
-
-  return { sig, burned: balance };
-}
-
-// ═══════════════════════════════════════
-// ADD LP (post-migration: 100% of fees)
+// ADD LP (post-migration)
 // ═══════════════════════════════════════
 
 async function doAddLp(solAmount: number): Promise<{ buySig: string; lpSig: string }> {
-  const poolKey = PumpSwap.getPoolPda(config.mint);
-  const pumpAmmSdk = new PumpSwap.PumpAmmSdk();
+  const poolKey = PumpSwap.canonicalPumpPoolPda(config.mint);
 
-  // Step 1: Buy tokens with 65% of LP amount
+  // Tx 1 — buy tokens with 65% of SOL
   const buySol = solAmount * 0.65;
-  const depositSol = solAmount * 0.35;
+  const buySolBn = new BN(Math.floor(buySol * LAMPORTS_PER_SOL));
 
   console.log(`[lp] Buying tokens with ${buySol.toFixed(4)} SOL...`);
-  const solBn = new BN(Math.floor(buySol * LAMPORTS_PER_SOL));
-  const swapState = await pumpAmmSdk.swapSolanaState(connection, poolKey, agent.publicKey);
-  const buyIx = pumpAmmSdk.buyQuoteInput(swapState, solBn, 5);
-  appendV2Account(buyIx, PUMP_AMM_PROGRAM_ID, poolV2Pda(config.mint));
-  const buyTx = new Transaction().add(...buyIx);
-  const buySig = await sendAndConfirm(connection, buyTx, agent);
+  const swapState = await pumpAmmOnline.swapSolanaState(poolKey, agent.publicKey);
+  const buyIx = await pumpAmmOffline.buyQuoteInput(swapState, buySolBn, 5);
+  const buySig = await sendAndConfirm(connection, new Transaction().add(...buyIx), agent);
   console.log(`[lp] Buy tx: ${buySig}`);
 
   await sleep(4000);
 
-  // Step 2: Deposit LP (35% SOL + bought tokens)
-  console.log(`[lp] Depositing LP with ${depositSol.toFixed(4)} SOL...`);
-  const liquidityState = await pumpAmmSdk.liquiditySolanaState(connection, poolKey, agent.publicKey);
-  const quoteAmount = new BN(Math.floor(depositSol * LAMPORTS_PER_SOL));
+  // Tx 2 — deposit SOL + tokens as LP (35% of SOL)
+  const depositSol = solAmount * 0.35;
+  const depositSolBn = new BN(Math.floor(depositSol * LAMPORTS_PER_SOL));
 
-  const { lpToken } = pumpAmmSdk.depositAutocompleteBaseAndLpTokenFromQuote(
+  console.log(`[lp] Depositing LP with ${depositSol.toFixed(4)} SOL...`);
+  const liquidityState = await pumpAmmOnline.liquiditySolanaState(poolKey, agent.publicKey);
+
+  const { lpToken } = pumpAmmOffline.depositAutocompleteBaseAndLpTokenFromQuote(
     liquidityState,
-    quoteAmount,
+    depositSolBn,
     10,
   );
 
-  const depositIx = pumpAmmSdk.depositInstructions(liquidityState, lpToken, 10);
+  const depositIx = await pumpAmmOffline.depositInstructions(liquidityState, lpToken, 10);
   appendV2Account(depositIx, PUMP_AMM_PROGRAM_ID, poolV2Pda(config.mint));
-  const tx = new Transaction().add(...depositIx);
-  const lpSig = await sendAndConfirm(connection, tx, agent);
+  const lpSig = await sendAndConfirm(connection, new Transaction().add(...depositIx), agent);
   console.log(`[lp] Deposit tx: ${lpSig}`);
 
   return { buySig, lpSig };
@@ -185,7 +179,15 @@ async function doAddLp(solAmount: number): Promise<{ buySig: string; lpSig: stri
 // MAIN CYCLE
 // ═══════════════════════════════════════
 
+let cycleRunning = false;
+
 export async function runCycle(): Promise<void> {
+  if (cycleRunning) {
+    console.log("[cycle] Skipping — previous cycle still running");
+    return;
+  }
+  cycleRunning = true;
+
   console.log("\n══════════════════════════════════════");
   console.log(`[cycle] ${new Date().toISOString()}`);
   console.log("══════════════════════════════════════");
@@ -193,15 +195,12 @@ export async function runCycle(): Promise<void> {
   const feed: FeedEntry[] = [];
   let claimed = 0;
   let boughtBack = 0;
-  let burned = 0;
   let lpSol = 0;
   let action = "scan";
 
   try {
-    // Step 1: Claim fees
     const claimResult = await claimFees();
     if (!claimResult) {
-      // Nothing to claim — generate monitoring thought and save
       const thought = await generateThought({ claimed: 0, boughtBack: 0, burned: 0, lpSol: 0, action: "scan" });
       feed.push({ type: "thought", text: thought, timestamp: new Date().toISOString() });
       await saveAgentCycle({ claimed: 0, boughtBack: 0, burned: 0, lpSol: 0, thought, thoughtMeta: "monitoring", feed });
@@ -217,60 +216,58 @@ export async function runCycle(): Promise<void> {
       txSig: claimResult.sig,
     });
 
+    const walletLamports = await getSolBalance(connection, agent.publicKey);
+    const spendable = getSpendable(walletLamports, claimed);
+
+    if (spendable <= 0) {
+      console.log(`[cycle] Wallet too low to spend (${(walletLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL, reserve=${SOL_RESERVE})`);
+      const thought = await generateThought({ claimed, boughtBack: 0, burned: 0, lpSol: 0, action: "scan" });
+      feed.push({ type: "thought", text: thought, timestamp: new Date().toISOString() });
+      await saveAgentCycle({ claimed, boughtBack: 0, burned: 0, lpSol: 0, thought, thoughtMeta: "reserve", feed });
+      return;
+    }
+
+    console.log(`[cycle] Spendable: ${spendable.toFixed(4)} SOL (keeping ${SOL_RESERVE} SOL reserve)`);
+
     const migrated = await isTokenMigrated();
 
-    if (migrated) {
-      // Post-migration: 100% to LP
-      action = "lp";
-      console.log("[cycle] Post-migration — adding LP");
-      const lpResult = await doAddLp(claimed);
-      lpSol = claimed;
-      feed.push({
-        type: "lp",
-        text: `Added ${claimed.toFixed(4)} SOL to liquidity pool`,
-        amount: claimed,
-        timestamp: new Date().toISOString(),
-        txSig: lpResult.lpSig,
-      });
-    } else {
-      // Pre-migration: 100% buyback + burn
+    if (!migrated) {
       action = "buyback";
-      console.log("[cycle] Pre-migration — buyback + burn");
-      const buyResult = await doBuyback(claimed);
-      boughtBack = claimed;
+      console.log("[cycle] Pre-migration — buyback via bonding curve");
+      const buyResult = await doBuyback(spendable);
+      boughtBack = spendable;
       feed.push({
         type: "buyback",
-        text: `Bought ${buyResult.tokens.toString()} tokens for ${claimed.toFixed(4)} SOL`,
-        amount: claimed,
+        text: `Bought ${buyResult.tokens.toString()} tokens for ${spendable.toFixed(4)} SOL`,
+        amount: spendable,
         timestamp: new Date().toISOString(),
         txSig: buyResult.sig,
       });
-
-      const burnResult = await doBurn();
-      if (burnResult) {
-        burned = Number(burnResult.burned);
-        feed.push({
-          type: "burn",
-          text: `Burned ${burnResult.burned.toString()} tokens`,
-          amount: burned,
-          timestamp: new Date().toISOString(),
-          txSig: burnResult.sig,
-        });
-      }
+    } else {
+      action = "lp";
+      console.log("[cycle] Post-migration — adding LP");
+      const lpResult = await doAddLp(spendable);
+      lpSol = spendable;
+      feed.push({
+        type: "lp",
+        text: `Added ${spendable.toFixed(4)} SOL to liquidity pool`,
+        amount: spendable,
+        timestamp: new Date().toISOString(),
+        txSig: lpResult.lpSig,
+      });
     }
 
-    // Generate thought
-    const thought = await generateThought({ claimed, boughtBack, burned, lpSol, action });
+    const thought = await generateThought({ claimed, boughtBack, burned: 0, lpSol, action });
     feed.push({ type: "thought", text: thought, timestamp: new Date().toISOString() });
+    await saveAgentCycle({ claimed, boughtBack, burned: 0, lpSol, thought, thoughtMeta: action, feed });
 
-    // Save to Supabase
-    await saveAgentCycle({ claimed, boughtBack, burned, lpSol, thought, thoughtMeta: action, feed });
-
-    console.log(`[cycle] Done. claimed=${claimed}, action=${action}`);
+    console.log(`[cycle] Done. claimed=${claimed.toFixed(4)}, spent=${spendable.toFixed(4)}, action=${action}`);
   } catch (err: any) {
     console.error("[cycle] Error:", err.message ?? err);
     const thought = `Error during cycle: ${(err.message ?? "unknown").slice(0, 100)}`;
     feed.push({ type: "thought", text: thought, timestamp: new Date().toISOString() });
-    await saveAgentCycle({ claimed, boughtBack, burned, lpSol, thought, thoughtMeta: "error", feed });
+    await saveAgentCycle({ claimed, boughtBack, burned: 0, lpSol, thought, thoughtMeta: "error", feed });
+  } finally {
+    cycleRunning = false;
   }
 }

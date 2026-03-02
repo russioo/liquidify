@@ -123,7 +123,6 @@ export default function Mechanics() {
                   <div className="mt-1 flex items-center gap-3 text-[10px] font-mono">
                     <span className={
                       t.type === "buyback" ? "accent" :
-                      t.type === "burn" ? "text-red-400/50" :
                       t.type === "lp" ? "text-emerald-400/50" :
                       t.type === "claim" ? "text-amber-400/50" :
                       "text-white/15"
@@ -140,9 +139,8 @@ export default function Mechanics() {
             <div className="mt-8 grid grid-cols-2 gap-4 font-mono text-[12px]">
               {[
                 { k: "fees collected", v: data ? `${fmt(data.stats.totalClaimed)} SOL` : "..." },
-                { k: "added to pool", v: data ? `${fmt(data.stats.totalLpSol)} SOL` : "..." },
                 { k: "bought back", v: data ? `${fmt(data.stats.totalBoughtBack)} SOL` : "..." },
-                { k: "burned", v: data ? `${fmt(data.stats.totalBurned)} tokens` : "..." },
+                { k: "added to pool", v: data ? `${fmt(data.stats.totalLpSol)} SOL` : "..." },
               ].map((r) => (
                 <div key={r.k} className="flex justify-between py-2 border-b border-white/[0.03]">
                   <span className="text-white/12">{r.k}</span>

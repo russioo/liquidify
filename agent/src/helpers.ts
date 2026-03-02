@@ -63,6 +63,14 @@ export function appendV2Account(
   }
 }
 
+export async function getSolBalance(conn: Connection, pubkey: PublicKey): Promise<number> {
+  try {
+    return await conn.getBalance(pubkey, "confirmed");
+  } catch {
+    return 0;
+  }
+}
+
 export function getAgentTokenAta(agentPubkey: PublicKey, mint: PublicKey): PublicKey {
   const [ata] = PublicKey.findProgramAddressSync(
     [agentPubkey.toBuffer(), TOKEN_2022_PROGRAM_ID.toBuffer(), mint.toBuffer()],
