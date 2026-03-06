@@ -79,7 +79,7 @@ export default function Hero() {
           </div>
           <div className="flex items-center gap-2">
             <span className="text-white/15">added to pool</span>
-            <span className="text-white/40">{hasData ? `${fmt(lp)} SOL` : "..."}</span>
+            <span className="text-white/40">{hasData ? (lp > 0 ? `${fmt(lp)} SOL` : "post-migration") : "..."}</span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-white/15">status</span>

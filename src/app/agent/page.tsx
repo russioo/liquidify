@@ -57,7 +57,7 @@ export default function AgentPage() {
   const stats = [
     { label: "Total fees collected", value: data ? `${fmt(data.stats.totalClaimed)} SOL` : "...", accent: false },
     { label: "Total bought back", value: data ? `${fmt(data.stats.totalBoughtBack)} SOL` : "...", accent: true },
-    { label: "Added to LP", value: data ? `${fmt(data.stats.totalLpSol)} SOL` : "...", accent: false },
+    { label: "Added to LP", value: data ? (data.stats.totalLpSol > 0 ? `${fmt(data.stats.totalLpSol)} SOL` : "post-migration") : "...", accent: false },
     { label: "Status", value: meta ?? "monitoring", accent: true },
   ];
 
