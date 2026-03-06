@@ -29,12 +29,9 @@ export default function Navigation() {
         </Link>
 
         <div className="flex items-center gap-6 text-[13px]">
-          <a href="#how" className="hidden sm:block text-white/25 hover:text-white/60 transition-colors">
-            Protocol
-          </a>
-          <a href="#agent" className="hidden sm:block text-white/25 hover:text-white/60 transition-colors">
+          <Link href="/agent" className="hidden sm:block text-white/25 hover:text-white/60 transition-colors">
             Agent
-          </a>
+          </Link>
           <Link href="/launch" className="text-white/25 hover:text-white/60 transition-colors">
             Launch
           </Link>
