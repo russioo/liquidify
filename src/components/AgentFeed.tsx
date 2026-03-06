@@ -140,7 +140,7 @@ export default function AgentFeed() {
                     <span
                       className={`text-[10px] font-mono font-medium tracking-wider mt-[3px] w-[36px] shrink-0 ${typeColor[entry.type] ?? "text-white/15"}`}
                     >
-                      {typeLabel[entry.type] ?? entry.type.toUpperCase()}
+                      {typeLabel[entry.type] ?? (entry.type?.toUpperCase() || "—")}
                     </span>
                     <div className="flex-1 min-w-0">
                       <p className="text-[13px] leading-[1.6] text-white/35 group-hover:text-white/50 transition-colors">

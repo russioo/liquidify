@@ -35,6 +35,9 @@ export default function Navigation() {
           <a href="#agent" className="hidden sm:block text-white/25 hover:text-white/60 transition-colors">
             Agent
           </a>
+          <Link href="/launch" className="text-white/25 hover:text-white/60 transition-colors">
+            Launch
+          </Link>
           <Link href="/docs" className="text-white/25 hover:text-white/60 transition-colors">
             Docs
           </Link>
